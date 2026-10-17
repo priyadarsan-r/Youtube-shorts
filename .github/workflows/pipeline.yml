@@ -1,0 +1,92 @@
+name: 6-Hour Reel Automation
+
+schedule:
+  - cron: '0 */6 * * *'
+workflow_dispatch:
+
+jobs:
+  render-and-post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install System Utilities (FFmpeg & ImageMagick)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick ffmpeg fonts-liberation
+          sudo sed -i 's/<policy domain="path" rights="none" pattern="@\*"\/>/<policy domain="path" rights="read|write" pattern="@\*"\/>/g' /etc/ImageMagick-6/policy.xml
+
+      # ----------------------------------------------------
+      # CACHE SETUP
+      # ----------------------------------------------------
+      - name: Cache Python Venv & Playwright Browsers
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            venv
+            ~/.cache/ms-playwright
+          key: env-cache-${{ runner.os }}-${{ hashFiles('main.py') }}
+
+      - name: Install Python Dependencies & Browser
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install --upgrade pip
+          venv/bin/pip install requests beautifulsoup4 google-genai gTTS setuptools-rust openai-whisper playwright "moviepy<2.0.0" google-api-python-client google-auth-oauthlib google-auth-httplib2
+          venv/bin/playwright install chromium
+
+      - name: Install Playwright OS Dependencies
+        run: venv/bin/playwright install-deps chromium
+
+      # ----------------------------------------------------
+      # PIPELINE EXECUTION (SEPARATED STEPS)
+      # ----------------------------------------------------
+      - name: Route Traffic through Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos connect
+          sleep 5
+          curl ifconfig.me
+
+      - name: Step 1 - Fetch Trending Repos
+        run: venv/bin/python main.py fetch
+
+      - name: Step 2 - Generate Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: venv/bin/python main.py script
+
+      - name: Step 3 - Synthesize Audio & Subtitles
+        run: venv/bin/python main.py audio
+
+      - name: Step 4 - Capture Visuals
+        run: venv/bin/python main.py visuals
+
+      - name: Step 5 - Render Final Video
+        run: venv/bin/python main.py video
+
+      - name: Step 6 - Publish to YouTube Shorts
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        run: venv/bin/python main.py publish
+
+      - name: Upload Video Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instagram-reel
+          path: final_reel.mp4
+          retention-days: 5
